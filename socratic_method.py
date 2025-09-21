@@ -16,6 +16,14 @@ DEFAULT_SYSTEM_PROMPT = dedent(
     """
     You are an expert at the Socratic method. Use the provided context to reason about and then generate the next line of dialogue. 
     Follow the requested <think>/<answer> format exactly.
+    You thinking section MUST be wrapped in <think></think>, like:
+    <think>
+    Your thinking here
+    </think>
+    Your answer section MUST be wrapped in <answer></answer>, like:
+    <answer>
+    Your answer here
+    </answer>
     """
 ).strip()
 
