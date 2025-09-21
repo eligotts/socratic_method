@@ -229,7 +229,47 @@ def _normalize_sampling_args(sampling_args: Dict[str, Any] | None) -> Dict[str, 
     return {k: v for k, v in normalized.items() if v is not None}
 
 
-async def think_alignment_reward(
+_STATE_CACHE_ROOT_KEY = "_rubric_cache"
+_THINK_CACHE_KEY = "think_judge_scores"
+_ANSWER_CACHE_KEY = "answer_judge_scores"
+
+
+def _get_state_cache(state: Any, cache_key: str) -> Dict[str, Any] | None:
+    if not isinstance(state, dict):
+        return None
+    root = state.setdefault(_STATE_CACHE_ROOT_KEY, {})
+    if not isinstance(root, dict):
+        root = {}
+        state[_STATE_CACHE_ROOT_KEY] = root
+    cache = root.setdefault(cache_key, {})
+    if not isinstance(cache, dict):
+        cache = {}
+        root[cache_key] = cache
+    return cache
+
+
+def _prepare_cache(
+    primary_cache: Dict[str, Any] | None,
+    state: Dict[str, Any] | None,
+    cache_key: str,
+    request_token: Any,
+) -> Dict[str, Any] | None:
+    cache = primary_cache
+    if cache is None:
+        cache = _get_state_cache(state, cache_key)
+    if cache is None:
+        return None
+    if cache.get("token") != request_token:
+        cache.clear()
+        cache["token"] = request_token
+    return cache
+
+
+def _clamp_score(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+async def _fetch_think_judge_scores(
     completion: list[Dict[str, Any]],
     info: Dict[str, Any],
     parser: vf.Parser,
@@ -237,15 +277,14 @@ async def think_alignment_reward(
     judge_model: str,
     think_judge_prompt: str,
     judge_sampling_args: Dict[str, Any] | None = None,
-    **kwargs: Any,
-) -> float:
+) -> ThinkJudgeScores | None:
     assistant_messages = parser.get_assistant_messages(completion)
     if not assistant_messages:
-        return 0.0
-    parsed = parser.parse(assistant_messages[-1]["content"])
-    think_text = getattr(parsed, "think", None)
+        return None
+    parsed_message = parser.parse(assistant_messages[-1]["content"])
+    think_text = getattr(parsed_message, "think", None)
     if not think_text:
-        return 0.0
+        return None
 
     metadata = info or {}
     prompt = think_judge_prompt.format(
@@ -270,22 +309,61 @@ async def think_alignment_reward(
             **_normalize_sampling_args(judge_sampling_args),
         )
     except Exception:
-        return 0.0
+        return None
 
     message = response.choices[0].message.content if response.choices else None
     if not message:
-        return 0.0
-    parsed = _parse_structured_output(message, ThinkJudgeScores)
-    if not parsed:
-        return 0.0
-    components = [
-        float(parsed.premise_alignment),
-        float(parsed.objective_alignment),
-        float(parsed.tactic_consistency),
-        float(parsed.completeness),
-    ]
-    average = sum(components) / len(components)
-    return max(0.0, min(1.0, average))
+        return None
+    return _parse_structured_output(message, ThinkJudgeScores)
+
+
+async def _get_think_judge_scores(
+    completion: list[Dict[str, Any]],
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    think_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None,
+    think_judge_cache: Dict[str, Any] | None,
+    state: Dict[str, Any] | None,
+) -> ThinkJudgeScores | None:
+    request_token = (id(completion), id(info))
+    cache = _prepare_cache(
+        think_judge_cache, state, _THINK_CACHE_KEY, request_token
+    )
+    if cache is not None:
+        if "result" in cache:
+            return cache["result"]
+        existing_task = cache.get("task")
+        if isinstance(existing_task, asyncio.Task):
+            result = await existing_task
+            cache["result"] = result
+            cache.pop("task", None)
+            return result
+
+    async def _runner() -> ThinkJudgeScores | None:
+        return await _fetch_think_judge_scores(
+            completion,
+            info,
+            parser,
+            judge_client,
+            judge_model,
+            think_judge_prompt,
+            judge_sampling_args,
+        )
+
+    if cache is not None:
+        task = asyncio.create_task(_runner())
+        cache["task"] = task
+        try:
+            result = await task
+        finally:
+            cache.pop("task", None)
+        cache["result"] = result
+        return result
+
+    return await _runner()
 
 
 async def answer_embedding_similarity_reward(
@@ -335,7 +413,7 @@ async def answer_embedding_similarity_reward(
     return max(0.0, min(1.0, 0.5 * (cosine + 1.0)))
 
 
-async def answer_alignment_judge_reward(
+async def _fetch_answer_judge_scores(
     completion: list[Dict[str, Any]],
     answer: str,
     info: Dict[str, Any],
@@ -344,11 +422,10 @@ async def answer_alignment_judge_reward(
     judge_model: str,
     answer_judge_prompt: str,
     judge_sampling_args: Dict[str, Any] | None = None,
-    **kwargs: Any,
-) -> float:
+) -> AnswerJudgeScores | None:
     predicted = parser.parse_answer(completion) or ""
     if not predicted.strip() or not answer.strip():
-        return 0.0
+        return None
 
     metadata = info or {}
     prompt = answer_judge_prompt.format(
@@ -373,21 +450,272 @@ async def answer_alignment_judge_reward(
             **_normalize_sampling_args(judge_sampling_args),
         )
     except Exception:
-        return 0.0
+        return None
 
     message = response.choices[0].message.content if response.choices else None
     if not message:
+        return None
+    return _parse_structured_output(message, AnswerJudgeScores)
+
+
+async def _get_answer_judge_scores(
+    completion: list[Dict[str, Any]],
+    answer: str,
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    answer_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None,
+    answer_judge_cache: Dict[str, Any] | None,
+    state: Dict[str, Any] | None,
+) -> AnswerJudgeScores | None:
+    request_token = (id(completion), id(info), id(answer))
+    cache = _prepare_cache(
+        answer_judge_cache, state, _ANSWER_CACHE_KEY, request_token
+    )
+    if cache is not None:
+        if "result" in cache:
+            return cache["result"]
+        existing_task = cache.get("task")
+        if isinstance(existing_task, asyncio.Task):
+            result = await existing_task
+            cache["result"] = result
+            cache.pop("task", None)
+            return result
+
+    async def _runner() -> AnswerJudgeScores | None:
+        return await _fetch_answer_judge_scores(
+            completion,
+            answer,
+            info,
+            parser,
+            judge_client,
+            judge_model,
+            answer_judge_prompt,
+            judge_sampling_args,
+        )
+
+    if cache is not None:
+        task = asyncio.create_task(_runner())
+        cache["task"] = task
+        try:
+            result = await task
+        finally:
+            cache.pop("task", None)
+        cache["result"] = result
+        return result
+
+    return await _runner()
+
+
+async def think_premise_alignment_reward(
+    completion: list[Dict[str, Any]],
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    think_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None = None,
+    think_judge_cache: Dict[str, Any] | None = None,
+    state: Dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> float:
+    state = state or kwargs.get("state")
+    scores = await _get_think_judge_scores(
+        completion,
+        info,
+        parser,
+        judge_client,
+        judge_model,
+        think_judge_prompt,
+        judge_sampling_args,
+        think_judge_cache,
+        state,
+    )
+    if scores is None:
         return 0.0
-    parsed = _parse_structured_output(message, AnswerJudgeScores)
-    if not parsed:
+    return _clamp_score(float(scores.premise_alignment))
+
+
+async def think_objective_alignment_reward(
+    completion: list[Dict[str, Any]],
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    think_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None = None,
+    think_judge_cache: Dict[str, Any] | None = None,
+    state: Dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> float:
+    state = state or kwargs.get("state")
+    scores = await _get_think_judge_scores(
+        completion,
+        info,
+        parser,
+        judge_client,
+        judge_model,
+        think_judge_prompt,
+        judge_sampling_args,
+        think_judge_cache,
+        state,
+    )
+    if scores is None:
         return 0.0
-    components = [
-        float(parsed.semantic_fidelity),
-        float(parsed.tactic_alignment),
-        float(parsed.objective_progress),
-    ]
-    average = sum(components) / len(components)
-    return max(0.0, min(1.0, average))
+    return _clamp_score(float(scores.objective_alignment))
+
+
+async def think_tactic_consistency_reward(
+    completion: list[Dict[str, Any]],
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    think_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None = None,
+    think_judge_cache: Dict[str, Any] | None = None,
+    state: Dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> float:
+    state = state or kwargs.get("state")
+    scores = await _get_think_judge_scores(
+        completion,
+        info,
+        parser,
+        judge_client,
+        judge_model,
+        think_judge_prompt,
+        judge_sampling_args,
+        think_judge_cache,
+        state,
+    )
+    if scores is None:
+        return 0.0
+    return _clamp_score(float(scores.tactic_consistency))
+
+
+async def think_completeness_reward(
+    completion: list[Dict[str, Any]],
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    think_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None = None,
+    think_judge_cache: Dict[str, Any] | None = None,
+    state: Dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> float:
+    state = state or kwargs.get("state")
+    scores = await _get_think_judge_scores(
+        completion,
+        info,
+        parser,
+        judge_client,
+        judge_model,
+        think_judge_prompt,
+        judge_sampling_args,
+        think_judge_cache,
+        state,
+    )
+    if scores is None:
+        return 0.0
+    return _clamp_score(float(scores.completeness))
+
+
+async def answer_semantic_fidelity_reward(
+    completion: list[Dict[str, Any]],
+    answer: str,
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    answer_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None = None,
+    answer_judge_cache: Dict[str, Any] | None = None,
+    state: Dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> float:
+    state = state or kwargs.get("state")
+    scores = await _get_answer_judge_scores(
+        completion,
+        answer,
+        info,
+        parser,
+        judge_client,
+        judge_model,
+        answer_judge_prompt,
+        judge_sampling_args,
+        answer_judge_cache,
+        state,
+    )
+    if scores is None:
+        return 0.0
+    return _clamp_score(float(scores.semantic_fidelity))
+
+
+async def answer_tactic_alignment_reward(
+    completion: list[Dict[str, Any]],
+    answer: str,
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    answer_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None = None,
+    answer_judge_cache: Dict[str, Any] | None = None,
+    state: Dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> float:
+    state = state or kwargs.get("state")
+    scores = await _get_answer_judge_scores(
+        completion,
+        answer,
+        info,
+        parser,
+        judge_client,
+        judge_model,
+        answer_judge_prompt,
+        judge_sampling_args,
+        answer_judge_cache,
+        state,
+    )
+    if scores is None:
+        return 0.0
+    return _clamp_score(float(scores.tactic_alignment))
+
+
+async def answer_objective_progress_reward(
+    completion: list[Dict[str, Any]],
+    answer: str,
+    info: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    answer_judge_prompt: str,
+    judge_sampling_args: Dict[str, Any] | None = None,
+    answer_judge_cache: Dict[str, Any] | None = None,
+    state: Dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> float:
+    state = state or kwargs.get("state")
+    scores = await _get_answer_judge_scores(
+        completion,
+        answer,
+        info,
+        parser,
+        judge_client,
+        judge_model,
+        answer_judge_prompt,
+        judge_sampling_args,
+        answer_judge_cache,
+        state,
+    )
+    if scores is None:
+        return 0.0
+    return _clamp_score(float(scores.objective_progress))
 
 
 def _prepare_dataset(  # type: ignore[override]
@@ -528,8 +856,13 @@ def load_environment(
     )
 
     think_rubric = vf.Rubric(
-        funcs=[think_alignment_reward],
-        weights=[1.0],
+        funcs=[
+            think_premise_alignment_reward,
+            think_objective_alignment_reward,
+            think_tactic_consistency_reward,
+            think_completeness_reward,
+        ],
+        weights=[0.25, 0.25, 0.25, 0.25],
         parser=parser,
         parallelize_scoring=False,
     )
@@ -539,12 +872,17 @@ def load_environment(
             "judge_model": judge_model,
             "think_judge_prompt": think_prompt_template,
             "judge_sampling_args": judge_sampling_args or {"temperature": 0},
+            "think_judge_cache": {},
         }
     )
 
     answer_judge_rubric = vf.Rubric(
-        funcs=[answer_alignment_judge_reward],
-        weights=[1.0],
+        funcs=[
+            answer_semantic_fidelity_reward,
+            answer_tactic_alignment_reward,
+            answer_objective_progress_reward,
+        ],
+        weights=[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
         parser=parser,
         parallelize_scoring=False,
     )
@@ -554,6 +892,7 @@ def load_environment(
             "judge_model": judge_model,
             "answer_judge_prompt": answer_prompt_template,
             "judge_sampling_args": judge_sampling_args or {"temperature": 0},
+            "answer_judge_cache": {},
         }
     )
 
