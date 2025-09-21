@@ -10,6 +10,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 import verifiers as vf
+from fastembed import TextEmbedding  # type: ignore
 
 
 DEFAULT_SYSTEM_PROMPT = dedent(
@@ -83,7 +84,13 @@ DEFAULT_THINK_JUDGE_PROMPT = dedent(
     Return a JSON object with keys "premise_alignment", "objective_alignment",
     "tactic_consistency", "completeness", and "justification". Each numeric
     score must be a float between 0.0 and 1.0 inclusive. Be very discerning in your analysis. High scores
-    should only come from a very strong alignment with the ground truth.
+    should only come from a very strong alignment with the ground truth. Scoring guideline:
+    0 - 0.25: No alignment with the ground truth
+    0.26 - 0.5: Partial alignment with the ground truth
+    0.51 - 0.75: Strong alignment with the ground truth
+    0.76 - 1.0: Perfect alignment with the ground truth
+
+    BE VERY STRICT IN YOUR SCORES. Thoughts should only be getting scores in the 0.75+ range if they truly perfectly align with the ground truth.
 
     JSON schema for your response:
     {think_schema}
@@ -99,20 +106,20 @@ DEFAULT_ANSWER_JUDGE_PROMPT = dedent(
 
     Context
     -------
-    Global sketch: {global_sketch}
+    Global sketch this describes the overall argumentation strategy: {global_sketch}
     Conceded premises: {conceded_premises}
     Interlocutor profile: {interlocutor_profile}
-    Argument history summary: {argument_history_summary}
+    Dialogue summary: {argument_history_summary}
     Last dialogue turns:
     {dialogue_last_turns}
 
     Ground truth Socrates line: {ground_truth}
 
     Information on the ground truth Socrates line:
-    Abstract objective: {abstract_objective}
+    Abstract objective (how the line advances the argument): {abstract_objective}
     Key premises targeted: {key_premises_targeted}
-    Tactic: {socratic_tactic_employed}
-    Rationale: {rationale}
+    Tactic employed in the line of dialogue: {socratic_tactic_employed}
+    Rationale (larger scope understanding of how this line of dialogue fits into the argumentation strategy): {rationale}
 
     Model <answer> proposal:
     ---
@@ -139,6 +146,56 @@ DEFAULT_ANSWER_JUDGE_PROMPT = dedent(
 
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+class _EmbeddingDataItem:
+    def __init__(self, embedding: list[float]):
+        self.embedding = embedding
+
+
+class _EmbeddingResponse:
+    def __init__(self, data: list[_EmbeddingDataItem]):
+        self.data = data
+
+
+class _LocalEmbeddingsAPI:
+    def __init__(self, model_name: str):
+        # Lazy-init the underlying model to avoid overhead if not used
+        self._model_name = model_name
+        self._embedder: TextEmbedding | None = None
+
+    def _ensure_loaded(self) -> TextEmbedding:
+        if self._embedder is None:
+            self._embedder = TextEmbedding(model_name=self._model_name)
+        return self._embedder
+
+    async def create(self, model: str, input: list[str], **_: Any) -> _EmbeddingResponse:  # noqa: D401
+        """Create embeddings for a batch of texts using FastEmbed.
+
+        The "model" arg is accepted for compatibility but ignored; we use the
+        model provided at construction time.
+        """
+
+        def _embed(texts: list[str]) -> list[list[float]]:
+            embedder = self._ensure_loaded()
+            vectors = list(embedder.embed(texts))
+            out: list[list[float]] = []
+            for vec in vectors:
+                try:
+                    out.append(vec.tolist())  # type: ignore[attr-defined]
+                except Exception:
+                    out.append([float(x) for x in vec])  # type: ignore[assignment]
+            return out
+
+        vectors = await asyncio.to_thread(_embed, input)
+        return _EmbeddingResponse([_EmbeddingDataItem(v) for v in vectors])
+
+
+class LocalEmbeddingClient:
+    """Minimal adapter to mimic AsyncOpenAI embeddings.create API using FastEmbed."""
+
+    def __init__(self, model_name: str):
+        self.embeddings = _LocalEmbeddingsAPI(model_name)
 
 
 class _BaseJudgeScores(BaseModel):
@@ -791,7 +848,7 @@ def load_environment(
     judge_sampling_args: Dict[str, Any] | None = None,
     think_judge_prompt: str | None = None,
     answer_judge_prompt: str | None = None,
-    embedding_model: str = "text-embedding-3-small",
+    embedding_model: str = "BAAI/bge-small-en-v1.5",
     embedding_base_url: str = "https://api.openai.com/v1",
     embedding_api_key_var: str = "OPENAI_API_KEY",
     **env_kwargs: Any,
@@ -846,10 +903,7 @@ def load_environment(
         base_url=judge_base_url,
         api_key=os.getenv(judge_api_key_var, "EMPTY"),
     )
-    embed_client = AsyncOpenAI(
-        base_url=embedding_base_url,
-        api_key=os.getenv(embedding_api_key_var, "EMPTY"),
-    )
+    embed_client = LocalEmbeddingClient(model_name=embedding_model)
 
     embedding_rubric = vf.Rubric(
         funcs=[answer_embedding_similarity_reward, parser.get_format_reward_func()],
