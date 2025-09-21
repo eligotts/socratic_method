@@ -71,18 +71,19 @@ DEFAULT_THINK_JUDGE_PROMPT = dedent(
     ---
 
     Score each criterion from 0.0 to 1.0:
-      1. premise_alignment – does the thought recall and leverage the conceded
-         premises and targeted premises appropriately?
+      1. premise_alignment – does the thought recall and leverage the same conceded
+         premises and targeted premises as the ground truth 'key premises targeted'?
       2. objective_alignment – is the plan oriented toward the abstract objective
-         and rationale for this move?
-      3. tactic_consistency – is the proposed approach consistent with the stated
-         Socratic tactic and dialogue tone?
+         and rationale for this move? Compare the ground truth 'abstract objective' and 'rationale' to the thought.
+      3. tactic_consistency – is the proposed approach consistent with the ground truth
+         Socratic tactic?
       4. completeness – does the thought outline a concrete plan that bridges
-         from prior dialogue to the next utterance?
+         from prior dialogue to the next utterance? Compare the ground truth 'rationale' to the thought.
 
     Return a JSON object with keys "premise_alignment", "objective_alignment",
     "tactic_consistency", "completeness", and "justification". Each numeric
-    score must be a float between 0.0 and 1.0 inclusive.
+    score must be a float between 0.0 and 1.0 inclusive. Be very discerning in your analysis. High scores
+    should only come from a very strong alignment with the ground truth.
 
     JSON schema for your response:
     {think_schema}
