@@ -83,7 +83,13 @@ DEFAULT_THINK_JUDGE_PROMPT = dedent(
     Return a JSON object with keys "premise_alignment", "objective_alignment",
     "tactic_consistency", "completeness", and "justification". Each numeric
     score must be a float between 0.0 and 1.0 inclusive. Be very discerning in your analysis. High scores
-    should only come from a very strong alignment with the ground truth.
+    should only come from a very strong alignment with the ground truth. Scoring guideline:
+    0 - 0.25: No alignment with the ground truth
+    0.26 - 0.5: Partial alignment with the ground truth
+    0.51 - 0.75: Strong alignment with the ground truth
+    0.76 - 1.0: Perfect alignment with the ground truth
+
+    BE VERY STRICT IN YOUR SCORES. Thoughts should only be getting scores in the 0.75+ range if they truly perfectly align with the ground truth.
 
     JSON schema for your response:
     {think_schema}
@@ -99,20 +105,20 @@ DEFAULT_ANSWER_JUDGE_PROMPT = dedent(
 
     Context
     -------
-    Global sketch: {global_sketch}
+    Global sketch this describes the overall argumentation strategy: {global_sketch}
     Conceded premises: {conceded_premises}
     Interlocutor profile: {interlocutor_profile}
-    Argument history summary: {argument_history_summary}
+    Dialogue summary: {argument_history_summary}
     Last dialogue turns:
     {dialogue_last_turns}
 
     Ground truth Socrates line: {ground_truth}
 
     Information on the ground truth Socrates line:
-    Abstract objective: {abstract_objective}
+    Abstract objective (how the line advances the argument): {abstract_objective}
     Key premises targeted: {key_premises_targeted}
-    Tactic: {socratic_tactic_employed}
-    Rationale: {rationale}
+    Tactic employed in the line of dialogue: {socratic_tactic_employed}
+    Rationale (larger scope understanding of how this line of dialogue fits into the argumentation strategy): {rationale}
 
     Model <answer> proposal:
     ---
