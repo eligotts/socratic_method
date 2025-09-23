@@ -94,7 +94,7 @@ async def _make_judge_call(
     judge_sampling_args: Dict[str, Any] | None = None,
 ) -> float:
     """Make a single judge model call and parse the float score."""
-    full_prompt = prompt + "\n\n" + score_request + "\n\nDO NOT return anything else but the single float score."
+    full_prompt = prompt + "\n\n" + score_request + "\n\nDO NOT return anything else but the single float score. /no_think"
     
     try:
         response = await judge_client.chat.completions.create(
@@ -252,7 +252,7 @@ async def think_premise_alignment_reward(
     score_request = (
         "Score the premise_alignment (0.0 to 1.0): does the thought recall and leverage "
         "the same conceded premises and targeted premises as the ground truth 'key premises targeted'? "
-        "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
+        "Be very discerning. High scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.\n\n"
         "Return only the float score:"
     )
     
@@ -283,7 +283,7 @@ async def think_objective_alignment_reward(
     score_request = (
         "Score the objective_alignment (0.0 to 1.0): is the plan oriented toward the abstract objective "
         "and rationale for this move? Compare the ground truth 'abstract objective' and 'rationale' to the thought. "
-        "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
+        "Be very discerning. High scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.\n\n"
         "Return only the float score:"
     )
     
@@ -314,7 +314,7 @@ async def think_tactic_consistency_reward(
     score_request = (
         "Score the tactic_consistency (0.0 to 1.0): is the proposed approach consistent with the ground truth "
         "Socratic tactic? "
-        "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
+        "Be very discerning. High scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.\n\n"
         "Return only the float score:"
     )
     
@@ -345,7 +345,7 @@ async def think_completeness_reward(
     score_request = (
         "Score the completeness (0.0 to 1.0): does the thought outline a concrete plan that bridges "
         "from prior dialogue to the next utterance? Compare the ground truth 'rationale' to the thought. "
-        "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
+        "Be very discerning. High scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.\n\n"
         "Return only the float score:"
     )
     
@@ -374,7 +374,7 @@ async def answer_semantic_fidelity_reward(
     
     prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
     score_request = (
-        "Score the semantic_fidelity (0.0 to 1.0): how well does the answer match the meaning and argumentative force "
+        "Score the semantic_fidelity (0.0 to 1.0): how well does the predicted line of dialogue match the meaning and argumentative force "
         "of the ground truth? "
         "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
         "Return only the float score:"
@@ -405,8 +405,7 @@ async def answer_tactic_alignment_reward(
     
     prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
     score_request = (
-        "Score the answer_tactic_alignment (0.0 to 1.0): does the answer adhere to the Socratic tactic and "
-        "dialogue tone? "
+        "Score the answer_tactic_alignment (0.0 to 1.0): does the predicted line of dialogue adhere to the Socratic tactic?"
         "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
         "Return only the float score:"
     )
@@ -436,7 +435,7 @@ async def answer_objective_progress_reward(
     
     prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
     score_request = (
-        "Score the objective_progress (0.0 to 1.0): does the answer advance the stated abstract objective using "
+        "Score the objective_progress (0.0 to 1.0): does the predicted line of dialogue advance the stated abstract objective using "
         "the key premises? "
         "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
         "Return only the float score:"
@@ -503,8 +502,8 @@ def load_environment(
     num_eval_examples: int = -1,
     holdout_seed: int = 42,
     system_prompt: str | None = None,
-    judge_model: str = "google/gemini-2.5-flash-lite",
-    judge_base_url: str = "https://openrouter.ai/api/v1",
+    judge_model: str = "Qwen/Qwen3-8B",
+    judge_base_url: str = "http://0.0.0.0:8002/v1",
     judge_api_key_var: str = "OPENROUTER_API_KEY",
     judge_sampling_args: Dict[str, Any] | None = None,
     embedding_model: str = "text-embedding-3-small",
@@ -567,7 +566,7 @@ def load_environment(
 
     embedding_rubric = vf.Rubric(
         funcs=[answer_embedding_similarity_reward, parser.get_format_reward_func()],
-        weights=[1.0, 0.1],
+        weights=[0.8, 0.2],
         parser=parser,
         parallelize_scoring=False,
     )
@@ -583,12 +582,13 @@ def load_environment(
             think_premise_alignment_reward,
             think_objective_alignment_reward,
             think_tactic_consistency_reward,
-            think_completeness_reward,
+            # think_completeness_reward,
             answer_semantic_fidelity_reward,
             answer_tactic_alignment_reward,
-            answer_objective_progress_reward,
+            # answer_objective_progress_reward,
         ],
-        weights=[1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0],
+        # weights=[1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0],
+        weights=[1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0],
         parser=parser,
         parallelize_scoring=False,
     )
