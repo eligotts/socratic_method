@@ -1,6 +1,6 @@
 [project]
 name = "socratic-method"
-description = "Your environment description here"
+description = "Teach a model the socratic method"
 tags = ["placeholder-tag", "train", "eval"]
 version = "0.1.0"
 requires-python = ">=3.11"
