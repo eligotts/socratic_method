@@ -107,10 +107,6 @@ async def _make_judge_call(
     
     message = response.choices[0].message.content if response.choices else None
 
-    # log the raw response to a file
-    # with open("judge_response.txt", "a") as f:
-    #     f.write("Response: \n\n" + message + "\n\n\n")
-
     if not message:
         return 0.0
     
@@ -127,10 +123,6 @@ async def _make_judge_call(
         pass
     
     return 0.0
-
-
-
-
 
 
 def _format_iterable(value: Any) -> str:
@@ -178,7 +170,7 @@ def _clamp_score(value: float) -> float:
 
 
 
-
+# Calculate the embedding similarity between the predicted and target
 async def answer_embedding_similarity_reward(
     completion: list[Dict[str, Any]],
     answer: str,
@@ -321,36 +313,6 @@ async def think_tactic_consistency_reward(
     return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
 
 
-async def think_completeness_reward(
-    completion: list[Dict[str, Any]],
-    answer: str,
-    info: Dict[str, Any],
-    parser: vf.Parser,
-    judge_client: AsyncOpenAI,
-    judge_model: str,
-    judge_sampling_args: Dict[str, Any] | None = None,
-    **kwargs: Any,
-) -> float:
-    assistant_messages = parser.get_assistant_messages(completion)
-    if not assistant_messages:
-        return 0.0
-    parsed_message = parser.parse(assistant_messages[-1]["content"])
-    think_text = getattr(parsed_message, "think", None)
-    predicted_answer = getattr(parsed_message, "answer", None)
-    
-    if not think_text or not predicted_answer:
-        return 0.0
-    
-    prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
-    score_request = (
-        "Score the completeness (0.0 to 1.0): does the thought outline a concrete plan that bridges "
-        "from prior dialogue to the next utterance? Compare the ground truth 'rationale' to the thought. "
-        "Be very discerning. High scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.\n\n"
-        "Return only the float score:"
-    )
-    
-    return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
-
 
 async def answer_semantic_fidelity_reward(
     completion: list[Dict[str, Any]],
@@ -412,36 +374,6 @@ async def answer_tactic_alignment_reward(
     
     return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
 
-
-async def answer_objective_progress_reward(
-    completion: list[Dict[str, Any]],
-    answer: str,
-    info: Dict[str, Any],
-    parser: vf.Parser,
-    judge_client: AsyncOpenAI,
-    judge_model: str,
-    judge_sampling_args: Dict[str, Any] | None = None,
-    **kwargs: Any,
-) -> float:
-    assistant_messages = parser.get_assistant_messages(completion)
-    if not assistant_messages:
-        return 0.0
-    parsed_message = parser.parse(assistant_messages[-1]["content"])
-    think_text = getattr(parsed_message, "think", None)
-    predicted_answer = getattr(parsed_message, "answer", None)
-    
-    if not think_text or not predicted_answer:
-        return 0.0
-    
-    prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
-    score_request = (
-        "Score the objective_progress (0.0 to 1.0): does the predicted line of dialogue advance the stated abstract objective using "
-        "the key premises? "
-        "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
-        "Return only the float score:"
-    )
-    
-    return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
 
 
 def _prepare_dataset(  # type: ignore[override]
@@ -582,12 +514,9 @@ def load_environment(
             think_premise_alignment_reward,
             think_objective_alignment_reward,
             think_tactic_consistency_reward,
-            # think_completeness_reward,
             answer_semantic_fidelity_reward,
             answer_tactic_alignment_reward,
-            # answer_objective_progress_reward,
         ],
-        # weights=[1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0, 1.0/7.0],
         weights=[1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0],
         parser=parser,
         parallelize_scoring=False,
