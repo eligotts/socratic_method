@@ -86,43 +86,107 @@ def _build_shared_judge_prompt(
     ).strip()
 
 
-async def _make_judge_call(
-    prompt: str,
-    score_request: str,
+COMBINED_JUDGE_PROMPT = dedent(
+    """
+    Score all of the following criteria from 0.0 to 1.0. Be very discerning - high scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.
+
+    1. premise_alignment: Does the thought recall and leverage the same conceded premises and targeted premises as the ground truth 'key premises targeted'?
+    2. objective_alignment: Is the plan oriented toward the abstract objective and rationale for this move? Compare the ground truth 'abstract objective' and 'rationale' to the thought.
+    3. tactic_consistency: Is the proposed approach consistent with the ground truth Socratic tactic?
+    4. semantic_fidelity: How well does the predicted line of dialogue match the meaning and argumentative force of the ground truth?
+    5. tactic_alignment: Does the predicted line of dialogue adhere to the Socratic tactic?
+
+    Return ONLY valid JSON in this exact format (no other text):
+    {
+        "premise_alignment": 0.0,
+        "objective_alignment": 0.0,
+        "tactic_consistency": 0.0,
+        "semantic_fidelity": 0.0,
+        "tactic_alignment": 0.0
+    }
+    """
+).strip()
+
+# Cache key for combined judge scores
+_JUDGE_CACHE_KEY = "_combined_judge_scores"
+
+
+async def _get_combined_judge_scores(
+    info: Dict[str, Any],
+    think_block: str,
+    predicted_answer: str,
+    answer: str,
     judge_client: AsyncOpenAI,
     judge_model: str,
     judge_sampling_args: Dict[str, Any] | None = None,
-) -> float:
-    """Make a single judge model call and parse the float score."""
-    full_prompt = prompt + "\n\n" + score_request + "\n\nDO NOT return anything else but the single float score. /no_think"
-    
+    state: Dict[str, Any] | None = None,
+) -> Dict[str, float]:
+    """Make a single judge call and return all 5 scores as a dict."""
+    # Check cache first
+    if state is not None and _JUDGE_CACHE_KEY in state:
+        return state[_JUDGE_CACHE_KEY]
+
+    default_scores = {
+        "premise_alignment": 0.0,
+        "objective_alignment": 0.0,
+        "tactic_consistency": 0.0,
+        "semantic_fidelity": 0.0,
+        "tactic_alignment": 0.0,
+    }
+
+    base_prompt = _build_shared_judge_prompt(info, think_block, predicted_answer, answer)
+    full_prompt = f"{base_prompt}\n\n{COMBINED_JUDGE_PROMPT}"
+
     try:
         response = await judge_client.chat.completions.create(
             model=judge_model,
             messages=[{"role": "user", "content": full_prompt}],
             **_normalize_sampling_args(judge_sampling_args),
         )
-    except Exception:
-        return 0.0
-    
-    message = response.choices[0].message.content if response.choices else None
+    except Exception as e:
+        print(f"[combined_judge] ERROR: {e}")
+        if state is not None:
+            state[_JUDGE_CACHE_KEY] = default_scores
+        return default_scores
 
+    message = response.choices[0].message.content if response.choices else None
     if not message:
-        return 0.0
-    
-    # Parse the float score
+        print("[combined_judge] ERROR: No response from judge")
+        if state is not None:
+            state[_JUDGE_CACHE_KEY] = default_scores
+        return default_scores
+
+    # Parse JSON from response
     try:
-        # Strip whitespace and any surrounding text
-        score_text = message.strip()
-        # Try to extract just the number if it's in a sentence
-        match = re.search(r'\b([0-9]*\.?[0-9]+)\b', score_text)
-        if match:
-            score = float(match.group(1))
-            return _clamp_score(score)
-    except (ValueError, AttributeError):
-        pass
-    
-    return 0.0
+        # Try to extract JSON from the response (handle markdown code blocks)
+        json_text = message.strip()
+        if "```" in json_text:
+            # Extract content between code blocks
+            match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', json_text)
+            if match:
+                json_text = match.group(1)
+
+        scores = json.loads(json_text)
+
+        # Validate and clamp scores
+        result = {}
+        for key in default_scores:
+            if key in scores:
+                result[key] = _clamp_score(float(scores[key]))
+            else:
+                result[key] = 0.0
+
+        print(f"[combined_judge] scores={result}")
+
+        if state is not None:
+            state[_JUDGE_CACHE_KEY] = result
+        return result
+
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        print(f"[combined_judge] ERROR: Could not parse JSON from: {message[:200]}... | {e}")
+        if state is not None:
+            state[_JUDGE_CACHE_KEY] = default_scores
+        return default_scores
 
 
 def _format_iterable(value: Any) -> str:
@@ -220,159 +284,125 @@ async def answer_embedding_similarity_reward(
 
 
 
-async def think_premise_alignment_reward(
+async def _get_judge_score(
+    score_key: str,
     completion: list[Dict[str, Any]],
     answer: str,
     info: Dict[str, Any],
+    state: Dict[str, Any],
     parser: vf.Parser,
     judge_client: AsyncOpenAI,
     judge_model: str,
     judge_sampling_args: Dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> float:
+    """Helper to get a specific score from the combined judge call."""
     assistant_messages = parser.get_assistant_messages(completion)
     if not assistant_messages:
         return 0.0
     parsed_message = parser.parse(assistant_messages[-1]["content"])
     think_text = getattr(parsed_message, "think", None)
     predicted_answer = getattr(parsed_message, "answer", None)
-    
+
     if not think_text or not predicted_answer:
         return 0.0
-    
-    prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
-    score_request = (
-        "Score the premise_alignment (0.0 to 1.0): does the thought recall and leverage "
-        "the same conceded premises and targeted premises as the ground truth 'key premises targeted'? "
-        "Be very discerning. High scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.\n\n"
-        "Return only the float score:"
+
+    scores = await _get_combined_judge_scores(
+        info=info,
+        think_block=think_text,
+        predicted_answer=predicted_answer,
+        answer=answer,
+        judge_client=judge_client,
+        judge_model=judge_model,
+        judge_sampling_args=judge_sampling_args,
+        state=state,
     )
-    
-    return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
+    return scores.get(score_key, 0.0)
+
+
+async def think_premise_alignment_reward(
+    completion: list[Dict[str, Any]],
+    answer: str,
+    info: Dict[str, Any],
+    state: Dict[str, Any],
+    parser: vf.Parser,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+    judge_sampling_args: Dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> float:
+    return await _get_judge_score(
+        "premise_alignment", completion, answer, info, state, parser,
+        judge_client, judge_model, judge_sampling_args, **kwargs
+    )
 
 
 async def think_objective_alignment_reward(
     completion: list[Dict[str, Any]],
     answer: str,
     info: Dict[str, Any],
+    state: Dict[str, Any],
     parser: vf.Parser,
     judge_client: AsyncOpenAI,
     judge_model: str,
     judge_sampling_args: Dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> float:
-    assistant_messages = parser.get_assistant_messages(completion)
-    if not assistant_messages:
-        return 0.0
-    parsed_message = parser.parse(assistant_messages[-1]["content"])
-    think_text = getattr(parsed_message, "think", None)
-    predicted_answer = getattr(parsed_message, "answer", None)
-    
-    if not think_text or not predicted_answer:
-        return 0.0
-    
-    prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
-    score_request = (
-        "Score the objective_alignment (0.0 to 1.0): is the plan oriented toward the abstract objective "
-        "and rationale for this move? Compare the ground truth 'abstract objective' and 'rationale' to the thought. "
-        "Be very discerning. High scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.\n\n"
-        "Return only the float score:"
+    return await _get_judge_score(
+        "objective_alignment", completion, answer, info, state, parser,
+        judge_client, judge_model, judge_sampling_args, **kwargs
     )
-    
-    return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
 
 
 async def think_tactic_consistency_reward(
     completion: list[Dict[str, Any]],
     answer: str,
     info: Dict[str, Any],
+    state: Dict[str, Any],
     parser: vf.Parser,
     judge_client: AsyncOpenAI,
     judge_model: str,
     judge_sampling_args: Dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> float:
-    assistant_messages = parser.get_assistant_messages(completion)
-    if not assistant_messages:
-        return 0.0
-    parsed_message = parser.parse(assistant_messages[-1]["content"])
-    think_text = getattr(parsed_message, "think", None)
-    predicted_answer = getattr(parsed_message, "answer", None)
-    
-    if not think_text or not predicted_answer:
-        return 0.0
-    
-    prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
-    score_request = (
-        "Score the tactic_consistency (0.0 to 1.0): is the proposed approach consistent with the ground truth "
-        "Socratic tactic? "
-        "Be very discerning. High scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.\n\n"
-        "Return only the float score:"
+    return await _get_judge_score(
+        "tactic_consistency", completion, answer, info, state, parser,
+        judge_client, judge_model, judge_sampling_args, **kwargs
     )
-    
-    return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
-
 
 
 async def answer_semantic_fidelity_reward(
     completion: list[Dict[str, Any]],
     answer: str,
     info: Dict[str, Any],
+    state: Dict[str, Any],
     parser: vf.Parser,
     judge_client: AsyncOpenAI,
     judge_model: str,
     judge_sampling_args: Dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> float:
-    assistant_messages = parser.get_assistant_messages(completion)
-    if not assistant_messages:
-        return 0.0
-    parsed_message = parser.parse(assistant_messages[-1]["content"])
-    think_text = getattr(parsed_message, "think", None)
-    predicted_answer = getattr(parsed_message, "answer", None)
-    
-    if not think_text or not predicted_answer:
-        return 0.0
-    
-    prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
-    score_request = (
-        "Score the semantic_fidelity (0.0 to 1.0): how well does the predicted line of dialogue match the meaning and argumentative force "
-        "of the ground truth? "
-        "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
-        "Return only the float score:"
+    return await _get_judge_score(
+        "semantic_fidelity", completion, answer, info, state, parser,
+        judge_client, judge_model, judge_sampling_args, **kwargs
     )
-    
-    return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
 
 
 async def answer_tactic_alignment_reward(
     completion: list[Dict[str, Any]],
     answer: str,
     info: Dict[str, Any],
+    state: Dict[str, Any],
     parser: vf.Parser,
     judge_client: AsyncOpenAI,
     judge_model: str,
     judge_sampling_args: Dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> float:
-    assistant_messages = parser.get_assistant_messages(completion)
-    if not assistant_messages:
-        return 0.0
-    parsed_message = parser.parse(assistant_messages[-1]["content"])
-    think_text = getattr(parsed_message, "think", None)
-    predicted_answer = getattr(parsed_message, "answer", None)
-    
-    if not think_text or not predicted_answer:
-        return 0.0
-    
-    prompt = _build_shared_judge_prompt(info, think_text, predicted_answer, answer)
-    score_request = (
-        "Score the answer_tactic_alignment (0.0 to 1.0): does the predicted line of dialogue adhere to the Socratic tactic?"
-        "Be very discerning. High scores (0.75+) should only come from perfect alignment with the ground truth.\n\n"
-        "Return only the float score:"
+    return await _get_judge_score(
+        "tactic_alignment", completion, answer, info, state, parser,
+        judge_client, judge_model, judge_sampling_args, **kwargs
     )
-    
-    return await _make_judge_call(prompt, score_request, judge_client, judge_model, judge_sampling_args)
 
 
 
@@ -434,9 +464,9 @@ def load_environment(
     num_eval_examples: int = -1,
     holdout_seed: int = 42,
     system_prompt: str | None = None,
-    judge_model: str = "Qwen/Qwen3-8B",
-    judge_base_url: str = "http://0.0.0.0:8002/v1",
-    judge_api_key_var: str = "OPENROUTER_API_KEY",
+    judge_model: str = "google/gemini-3-flash-preview",
+    judge_base_url: str = "https://api.pinference.ai/api/v1",
+    judge_api_key_var: str = "PRIME_API_KEY",
     judge_sampling_args: Dict[str, Any] | None = None,
     embedding_model: str = "text-embedding-3-small",
     embedding_base_url: str = "https://api.openai.com/v1",
@@ -487,10 +517,6 @@ def load_environment(
 
     parser = vf.XMLParser(["think", "answer"], answer_field="answer")
 
-    judge_client = AsyncOpenAI(
-        base_url=judge_base_url,
-        api_key=os.getenv(judge_api_key_var, "EMPTY"),
-    )
     embed_client = AsyncOpenAI(
         base_url=embedding_base_url,
         api_key=os.getenv(embedding_api_key_var, "EMPTY"),
@@ -508,6 +534,11 @@ def load_environment(
         }
     )
 
+    # Judge-based rubric using base Rubric with custom reward functions
+    judge_client = AsyncOpenAI(
+        base_url=judge_base_url,
+        api_key=os.getenv(judge_api_key_var, "EMPTY"),
+    )
     combined_rubric = vf.Rubric(
         funcs=[
             think_premise_alignment_reward,
@@ -516,17 +547,14 @@ def load_environment(
             answer_semantic_fidelity_reward,
             answer_tactic_alignment_reward,
         ],
-        weights=[1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0],
+        weights=[1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0, 1.0/5.0],
         parser=parser,
-        parallelize_scoring=False,
     )
-    combined_rubric.class_objects.update(
-        {
-            "judge_client": judge_client,
-            "judge_model": judge_model,
-            "judge_sampling_args": judge_sampling_args or {"temperature": 0},
-        }
-    )
+    combined_rubric.class_objects.update({
+        "judge_client": judge_client,
+        "judge_model": judge_model,
+        "judge_sampling_args": judge_sampling_args or {},
+    })
 
     rubric = vf.RubricGroup(
         [embedding_rubric, combined_rubric]

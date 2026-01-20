@@ -7,4 +7,5 @@ test_azr_env.py
 test.py
 train.py
 code_review.md
+.prime
 design_doc.md
