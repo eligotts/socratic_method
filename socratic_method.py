@@ -500,7 +500,6 @@ def load_environment(
         funcs=[answer_embedding_similarity_reward, parser.get_format_reward_func()],
         weights=[0.8, 0.2],
         parser=parser,
-        parallelize_scoring=False,
     )
     embedding_rubric.class_objects.update(
         {
