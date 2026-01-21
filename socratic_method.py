@@ -36,7 +36,7 @@ PROMPT_TEMPLATE = dedent(
     Here are the last lines of dialogue:
     {dialogue_last_turns}
 
-    Think about which premises to target, how your next line advances the argument, and be explicit about the direction you intend to take the argument. Then wrap your final dialogue line in <answer></answer>.
+    Think about which premises to target, how your next line advances the argument, and be explicit about the direction you intend to take the argument. Verbalize this step by step thinking BEFORE you write your answer. Then wrap your final dialogue line in <answer></answer>.
     """
 ).strip()
 
