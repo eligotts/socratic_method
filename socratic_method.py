@@ -14,15 +14,15 @@ import verifiers as vf
 
 DEFAULT_SYSTEM_PROMPT = dedent(
     """
-    You are an expert at the Socratic method. Use the provided context to reason about and then generate the next line of dialogue. 
-    Follow the requested <think>/<answer> format exactly.
-    You thinking section MUST be wrapped in <think></think>, and your answer section MUST be wrapped in <answer></answer>.
+    You are an expert at the Socratic method. Use the provided context to reason about and then generate the next line of dialogue.
+
+    Think freely about the dialogue, considering strategy, premises, and tactics. When you have decided on your next line, wrap ONLY the actual dialogue line in <answer></answer> tags.
+
     Example response:
-    <think>
-    Your thinking here
-    </think>
+    I need to consider the interlocutor's position and find a way to guide them toward recognizing the contradiction in their reasoning. Given that they've already conceded X, I should ask a question that builds on that...
+
     <answer>
-    Your answer here
+    Your actual dialogue line here
     </answer>
     """
 ).strip()
@@ -36,16 +36,13 @@ PROMPT_TEMPLATE = dedent(
     Here are the last lines of dialogue:
     {dialogue_last_turns}
 
-    Wrap in <think></think> as you consider what to say next. Think about which
-    premises to target, how this next line advances the argument, and be explicit
-    about the direction you intend to take the argument given the line you come up with.
-    Wrap in <answer></answer> with exactly the next line of dialogue you come up with.
+    Think about which premises to target, how your next line advances the argument, and be explicit about the direction you intend to take the argument. Then wrap your final dialogue line in <answer></answer>.
     """
 ).strip()
 
 def _build_shared_judge_prompt(
     info: Dict[str, Any],
-    think_block: str,
+    raw_model_output: str,
     predicted_answer: str,
     answer: str,
 ) -> str:
@@ -72,13 +69,12 @@ def _build_shared_judge_prompt(
         Tactic employed in the line of dialogue: {metadata.get("socratic_tactic_employed", "")}
         Rationale (larger scope understanding of how this line of dialogue fits into the argumentation strategy): {metadata.get("rationale", "")}
 
-        Content you are evaluating:
-        Thought process behind the predicted line of dialogue:
+        Full model response (including reasoning and final answer):
         ---
-        {think_block}
+        {raw_model_output}
         ---
 
-        Predicted line of dialogue:
+        Extracted dialogue line (from <answer> tags):
         ---
         {predicted_answer}
         ---
@@ -90,11 +86,11 @@ COMBINED_JUDGE_PROMPT = dedent(
     """
     Score all of the following criteria from 0.0 to 1.0. Be very discerning - high scores (0.75+) should only come from PERFECT ALIGNMENT with the ground truth.
 
-    1. premise_alignment: Does the thought recall and leverage the same conceded premises and targeted premises as the ground truth 'key premises targeted'?
-    2. objective_alignment: Is the plan oriented toward the abstract objective and rationale for this move? Compare the ground truth 'abstract objective' and 'rationale' to the thought.
-    3. tactic_consistency: Is the proposed approach consistent with the ground truth Socratic tactic?
-    4. semantic_fidelity: How well does the predicted line of dialogue match the meaning and argumentative force of the ground truth?
-    5. tactic_alignment: Does the predicted line of dialogue adhere to the Socratic tactic?
+    1. premise_alignment: Does the model's reasoning recall and leverage the same conceded premises and targeted premises as the ground truth 'key premises targeted'?
+    2. objective_alignment: Is the model's reasoning oriented toward the abstract objective and rationale for this move? Compare the ground truth 'abstract objective' and 'rationale' to the reasoning.
+    3. tactic_consistency: Is the model's proposed approach consistent with the ground truth Socratic tactic?
+    4. semantic_fidelity: How well does the extracted dialogue line match the meaning and argumentative force of the ground truth?
+    5. tactic_alignment: Does the extracted dialogue line adhere to the Socratic tactic?
 
     Return ONLY valid JSON in this exact format (no other text):
     {
@@ -113,7 +109,7 @@ _JUDGE_CACHE_KEY = "_combined_judge_scores"
 
 async def _get_combined_judge_scores(
     info: Dict[str, Any],
-    think_block: str,
+    raw_model_output: str,
     predicted_answer: str,
     answer: str,
     judge_client: AsyncOpenAI,
@@ -134,7 +130,7 @@ async def _get_combined_judge_scores(
         "tactic_alignment": 0.0,
     }
 
-    base_prompt = _build_shared_judge_prompt(info, think_block, predicted_answer, answer)
+    base_prompt = _build_shared_judge_prompt(info, raw_model_output, predicted_answer, answer)
     full_prompt = f"{base_prompt}\n\n{COMBINED_JUDGE_PROMPT}"
 
     try:
@@ -300,16 +296,20 @@ async def _get_judge_score(
     assistant_messages = parser.get_assistant_messages(completion)
     if not assistant_messages:
         return 0.0
-    parsed_message = parser.parse(assistant_messages[-1]["content"])
-    think_text = getattr(parsed_message, "think", None)
-    predicted_answer = getattr(parsed_message, "answer", None)
 
-    if not think_text or not predicted_answer:
+    # Get raw model output
+    raw_model_output = str(assistant_messages[-1].get("content", ""))
+    if not raw_model_output.strip():
+        return 0.0
+
+    # Extract the answer from <answer> tags
+    predicted_answer = parser.parse_answer(completion)
+    if not predicted_answer:
         return 0.0
 
     scores = await _get_combined_judge_scores(
         info=info,
-        think_block=think_text,
+        raw_model_output=raw_model_output,
         predicted_answer=predicted_answer,
         answer=answer,
         judge_client=judge_client,
@@ -515,7 +515,7 @@ def load_environment(
             range(min(num_eval_examples, len(eval_dataset)))
         )
 
-    parser = vf.XMLParser(["think", "answer"], answer_field="answer")
+    parser = vf.XMLParser(["answer"], answer_field="answer")
 
     embed_client = AsyncOpenAI(
         base_url=embedding_base_url,
@@ -523,8 +523,8 @@ def load_environment(
     )
 
     embedding_rubric = vf.Rubric(
-        funcs=[answer_embedding_similarity_reward, parser.get_format_reward_func()],
-        weights=[0.8, 0.2],
+        funcs=[answer_embedding_similarity_reward],
+        weights=[1.0],
         parser=parser,
     )
     embedding_rubric.class_objects.update(
